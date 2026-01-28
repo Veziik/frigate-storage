@@ -1,5 +1,5 @@
 [Unit]
-Description=Frigate Recording Sync to GitHub LFS
+Description=Frigate Recording Sync to Google Drive
 After=network-online.target
 Wants=network-online.target
 
@@ -11,8 +11,8 @@ ExecStart=/home/daniel/frigate-storage/sync-recordings.sh
 StandardOutput=append:/home/daniel/frigate-storage/sync.log
 StandardError=append:/home/daniel/frigate-storage/sync.log
 
-# Timeout after 2 hours (large uploads may take time)
-TimeoutStartSec=7200
+# Timeout after 4 hours (large uploads may take time)
+TimeoutStartSec=14400
 
 [Install]
 WantedBy=multi-user.target

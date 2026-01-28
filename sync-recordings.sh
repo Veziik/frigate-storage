@@ -1,22 +1,22 @@
 #!/bin/bash
-# Frigate Recordings Sync Script - GitHub LFS Mode
-# Stages recordings temporarily, pushes to GitHub LFS, then cleans local copy
-# Requires: git-lfs, ~35GB temporary disk space
+# Frigate Recordings Sync Script - Google Drive via rclone
+# Syncs recordings to Google Drive with 90-day retention
+# Requires: rclone configured with 'gdrive' remote
 #
 # Storage model:
-# - Local: Only temporary staging (~1 day at a time)
-# - GitHub LFS: Full 90-day archive
-# - Frigate: 2-day rolling window
+# - Local Frigate: 2-day rolling window
+# - Google Drive: Full 90-day archive
+# - This script: Syncs before Frigate deletes, manages retention
 
 set -euo pipefail
 
 # Configuration
 FRIGATE_RECORDINGS="/home/daniel/frigate-setup/storage/recordings"
-STORAGE_REPO="/home/daniel/frigate-storage"
-STAGING_DIR="$STORAGE_REPO/recordings"
+RCLONE_REMOTE="gdrive:frigate-recordings"  # Adjust remote name if different
 RETENTION_DAYS=90
-LOG_FILE="$STORAGE_REPO/sync.log"
-LOCK_FILE="$STORAGE_REPO/.sync.lock"
+LOG_FILE="/home/daniel/frigate-storage/sync.log"
+LOCK_FILE="/home/daniel/frigate-storage/.sync.lock"
+LOCAL_MANIFEST="/home/daniel/frigate-storage/manifest.txt"
 
 # Logging function
 log() {
@@ -31,130 +31,106 @@ trap cleanup EXIT
 
 # Prevent concurrent runs
 if [ -f "$LOCK_FILE" ]; then
-    log "ERROR: Another sync is running (lock file exists). Exiting."
-    exit 1
+    LOCK_PID=$(cat "$LOCK_FILE" 2>/dev/null || echo "unknown")
+    if [ "$LOCK_PID" != "unknown" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
+        log "ERROR: Another sync is running (PID $LOCK_PID). Exiting."
+        exit 1
+    else
+        log "WARNING: Stale lock file found. Removing."
+        rm -f "$LOCK_FILE"
+    fi
 fi
 echo $$ > "$LOCK_FILE"
 
-log "========== Starting Frigate Recording Sync (LFS Mode) =========="
+log "========== Starting Frigate Recording Sync (Google Drive) =========="
 
-cd "$STORAGE_REPO"
-
-# Check available disk space (need at least 40GB for staging)
-AVAILABLE_GB=$(df -BG "$STORAGE_REPO" | awk 'NR==2 {print $4}' | tr -d 'G')
-if [ "$AVAILABLE_GB" -lt 40 ]; then
-    log "WARNING: Only ${AVAILABLE_GB}GB available. Need 40GB for safe staging."
+# Check rclone is available
+if ! command -v rclone &> /dev/null; then
+    log "ERROR: rclone is not installed. Install with: sudo apt install rclone"
+    exit 1
 fi
 
-# Get dates to sync (yesterday and today - before Frigate's 2-day cleanup)
+# Check remote is configured
+if ! rclone listremotes | grep -q "^gdrive:"; then
+    log "ERROR: rclone remote 'gdrive' not configured. Run: rclone config"
+    exit 1
+fi
+
+# Get dates to sync (yesterday and today)
 YESTERDAY=$(date -d "yesterday" '+%Y-%m-%d')
 TODAY=$(date '+%Y-%m-%d')
 
 log "Processing dates: $YESTERDAY, $TODAY"
-log "Available disk space: ${AVAILABLE_GB}GB"
 
-# Ensure staging directory exists
-mkdir -p "$STAGING_DIR"
+# Track sync stats
+SYNCED_FILES=0
+SYNCED_SIZE="0"
 
-# Process each date one at a time to minimize disk usage
+# Sync each date directory
 for DATE_DIR in "$YESTERDAY" "$TODAY"; do
     SOURCE_DIR="$FRIGATE_RECORDINGS/$DATE_DIR"
-    DEST_DIR="$STAGING_DIR/$DATE_DIR"
 
     if [ ! -d "$SOURCE_DIR" ]; then
         log "No recordings found for $DATE_DIR, skipping"
         continue
     fi
 
-    # Check if already synced (directory exists in git)
-    if git ls-tree -d HEAD --name-only 2>/dev/null | grep -q "recordings/$DATE_DIR"; then
-        log "$DATE_DIR already in repo, checking for new files..."
-    fi
+    # Count source files
+    FILE_COUNT=$(find "$SOURCE_DIR" -type f -name "*.mp4" 2>/dev/null | wc -l)
+    DIR_SIZE=$(du -sh "$SOURCE_DIR" 2>/dev/null | cut -f1)
 
-    log "Staging $DATE_DIR..."
+    log "Syncing $DATE_DIR: $FILE_COUNT files ($DIR_SIZE)..."
 
-    # Copy recordings to staging (rsync for efficiency)
-    rsync -av --info=progress2 "$SOURCE_DIR/" "$DEST_DIR/" 2>&1 | tail -5 | tee -a "$LOG_FILE"
-
-    if [ $? -ne 0 ]; then
-        log "ERROR: rsync failed for $DATE_DIR"
-        continue
-    fi
-
-    # Count files staged
-    FILE_COUNT=$(find "$DEST_DIR" -type f -name "*.mp4" 2>/dev/null | wc -l)
-    DIR_SIZE=$(du -sh "$DEST_DIR" 2>/dev/null | cut -f1)
-    log "Staged $FILE_COUNT files ($DIR_SIZE) for $DATE_DIR"
-
-    # Add to git (LFS will handle large files)
-    log "Adding to git..."
-    git add "$DEST_DIR"
-
-    # Commit this date
-    if ! git diff --cached --quiet; then
-        git commit -m "Add recordings: $DATE_DIR
-
-Files: $FILE_COUNT
-Size: $DIR_SIZE
-Cameras: $(ls "$DEST_DIR"/*/ 2>/dev/null | head -5 | xargs -I{} basename {} | tr '\n' ', ' || echo 'various')"
-
-        log "Pushing $DATE_DIR to GitHub LFS..."
-        if git push origin main 2>&1 | tee -a "$LOG_FILE"; then
-            log "Successfully pushed $DATE_DIR"
-
-            # Clean up local staging after successful push
-            log "Cleaning local staging for $DATE_DIR..."
-            rm -rf "$DEST_DIR"
-            git rm -rf --cached "$DEST_DIR" 2>/dev/null || true
-        else
-            log "ERROR: Push failed for $DATE_DIR. Keeping local copy for retry."
-        fi
+    # Sync to Google Drive using rclone
+    # --checksum: Use checksum for comparison (more accurate than modtime)
+    # --transfers 4: 4 parallel transfers
+    if rclone sync "$SOURCE_DIR" "$RCLONE_REMOTE/$DATE_DIR" \
+        --checksum \
+        --transfers 4 \
+        --stats-one-line \
+        --stats 30s \
+        --log-file="$LOG_FILE" \
+        --log-level INFO 2>&1 | tee -a "$LOG_FILE"; then
+        log "✓ Successfully synced $DATE_DIR"
+        ((SYNCED_FILES+=FILE_COUNT))
+        SYNCED_SIZE="$DIR_SIZE"
     else
-        log "No new files to commit for $DATE_DIR"
+        log "ERROR: Failed to sync $DATE_DIR"
     fi
 done
 
-# Update manifest (list of all recordings in repo)
-log "Updating remote manifest..."
-git ls-tree -r HEAD --name-only | grep "\.mp4$" | sort > "$STORAGE_REPO/manifest.txt" 2>/dev/null || true
-TOTAL_FILES=$(wc -l < "$STORAGE_REPO/manifest.txt" 2>/dev/null || echo "0")
-log "Total recordings in repo: $TOTAL_FILES files"
-
-# Commit manifest update
-git add manifest.txt 2>/dev/null || true
-if ! git diff --cached --quiet; then
-    git commit -m "Update manifest: $TOTAL_FILES files"
-    git push origin main 2>&1 | tee -a "$LOG_FILE" || true
-fi
-
-# Remote cleanup: Remove recordings older than retention period
-log "Checking for recordings older than $RETENTION_DAYS days to remove from repo..."
+# Cleanup: Remove recordings older than retention period from Google Drive
+log "Checking for old recordings to remove from Google Drive..."
 CUTOFF_DATE=$(date -d "$RETENTION_DAYS days ago" '+%Y-%m-%d')
 log "Cutoff date: $CUTOFF_DATE"
 
-# Find old directories in the repo
-OLD_DIRS=$(git ls-tree -d HEAD --name-only recordings/ 2>/dev/null | while read dir; do
-    DIR_NAME=$(basename "$dir")
+# List remote directories and remove old ones
+for REMOTE_DIR in $(rclone lsf "$RCLONE_REMOTE" --dirs-only 2>/dev/null || true); do
+    # Remove trailing slash
+    DIR_NAME="${REMOTE_DIR%/}"
     if [[ "$DIR_NAME" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [[ "$DIR_NAME" < "$CUTOFF_DATE" ]]; then
-        echo "$dir"
+        log "Removing old recordings from Drive: $DIR_NAME"
+        if rclone purge "$RCLONE_REMOTE/$DIR_NAME" 2>&1 | tee -a "$LOG_FILE"; then
+            log "✓ Removed $DIR_NAME"
+        else
+            log "ERROR: Failed to remove $DIR_NAME"
+        fi
     fi
-done)
+done
 
-if [ -n "$OLD_DIRS" ]; then
-    log "Removing old recordings from repo..."
-    for OLD_DIR in $OLD_DIRS; do
-        log "Removing: $OLD_DIR"
-        git rm -rf "$OLD_DIR" 2>/dev/null || true
-    done
+# Generate manifest of remote files
+log "Generating remote manifest..."
+rclone ls "$RCLONE_REMOTE" 2>/dev/null | grep ".mp4$" | sort > "$LOCAL_MANIFEST" || true
+TOTAL_FILES=$(wc -l < "$LOCAL_MANIFEST" 2>/dev/null || echo "0")
+TOTAL_SIZE=$(rclone size "$RCLONE_REMOTE" --json 2>/dev/null | grep -o '"bytes":[0-9]*' | cut -d: -f2 || echo "unknown")
 
-    if ! git diff --cached --quiet; then
-        git commit -m "Cleanup: Remove recordings before $CUTOFF_DATE"
-        git push origin main 2>&1 | tee -a "$LOG_FILE" || log "ERROR: Cleanup push failed"
-    fi
+# Convert bytes to human readable
+if [ "$TOTAL_SIZE" != "unknown" ] && [ -n "$TOTAL_SIZE" ]; then
+    TOTAL_SIZE_HR=$(numfmt --to=iec-i --suffix=B "$TOTAL_SIZE" 2>/dev/null || echo "${TOTAL_SIZE} bytes")
+else
+    TOTAL_SIZE_HR="unknown"
 fi
 
-# Final disk space check
-FINAL_SPACE=$(df -h "$STORAGE_REPO" | awk 'NR==2 {print $4}')
-log "Disk space after sync: $FINAL_SPACE available"
-
 log "========== Sync Complete =========="
+log "Synced: $SYNCED_FILES files today"
+log "Total in Google Drive: $TOTAL_FILES files ($TOTAL_SIZE_HR)"
