@@ -1,18 +1,19 @@
 #!/bin/bash
 # Frigate Recordings Sync Script - Google Drive via rclone
-# Syncs recordings to Google Drive with 90-day retention
-# Requires: rclone configured with 'gdrive' remote
+# Syncs back_door camera recordings to Google Drive with 90-day retention
+# Requires: rclone configured with 'Drive' remote
 #
 # Storage model:
 # - Local Frigate: 2-day rolling window
-# - Google Drive: Full 90-day archive
+# - Google Drive: 90-day archive (back_door only)
 # - This script: Syncs before Frigate deletes, manages retention
 
 set -euo pipefail
 
 # Configuration
 FRIGATE_RECORDINGS="/home/daniel/frigate-setup/storage/recordings"
-RCLONE_REMOTE="Drive:Frigate Recordings"  # Google Drive folder for recordings
+RCLONE_REMOTE="Drive:Frigate Recordings/back_door"  # Google Drive folder
+CAMERA="back_door"  # Only sync this camera
 RETENTION_DAYS=90
 LOG_FILE="/home/daniel/frigate-storage/sync.log"
 LOCK_FILE="/home/daniel/frigate-storage/.sync.lock"
@@ -66,7 +67,7 @@ log "Processing dates: $YESTERDAY, $TODAY"
 SYNCED_FILES=0
 SYNCED_SIZE="0"
 
-# Sync each date directory
+# Sync each date directory (back_door camera only)
 for DATE_DIR in "$YESTERDAY" "$TODAY"; do
     SOURCE_DIR="$FRIGATE_RECORDINGS/$DATE_DIR"
 
@@ -75,27 +76,32 @@ for DATE_DIR in "$YESTERDAY" "$TODAY"; do
         continue
     fi
 
-    # Count source files
-    FILE_COUNT=$(find "$SOURCE_DIR" -type f -name "*.mp4" 2>/dev/null | wc -l)
-    DIR_SIZE=$(du -sh "$SOURCE_DIR" 2>/dev/null | cut -f1)
+    # Count source files (back_door only)
+    FILE_COUNT=$(find "$SOURCE_DIR" -path "*/$CAMERA/*" -name "*.mp4" 2>/dev/null | wc -l)
+    DIR_SIZE=$(du -shc "$SOURCE_DIR"/*/"$CAMERA" 2>/dev/null | tail -1 | cut -f1)
 
-    log "Syncing $DATE_DIR: $FILE_COUNT files ($DIR_SIZE)..."
+    if [ "$FILE_COUNT" -eq 0 ]; then
+        log "No $CAMERA recordings for $DATE_DIR, skipping"
+        continue
+    fi
 
-    # Sync to Google Drive using rclone
-    # --checksum: Use checksum for comparison (more accurate than modtime)
-    # --transfers 4: 4 parallel transfers
-    if rclone sync "$SOURCE_DIR" "$RCLONE_REMOTE/$DATE_DIR" \
-        --checksum \
-        --transfers 4 \
+    log "Syncing $DATE_DIR/$CAMERA: $FILE_COUNT files ($DIR_SIZE)..."
+
+    # Sync to Google Drive using rclone (back_door only)
+    # --include: Only sync back_door camera files
+    # --transfers 8: 8 parallel transfers
+    if rclone copy "$SOURCE_DIR" "$RCLONE_REMOTE/$DATE_DIR" \
+        --include "**/$CAMERA/**" \
+        --transfers 8 \
         --stats-one-line \
         --stats 30s \
         --log-file="$LOG_FILE" \
         --log-level INFO 2>&1 | tee -a "$LOG_FILE"; then
-        log "✓ Successfully synced $DATE_DIR"
+        log "✓ Successfully synced $DATE_DIR/$CAMERA"
         ((SYNCED_FILES+=FILE_COUNT))
         SYNCED_SIZE="$DIR_SIZE"
     else
-        log "ERROR: Failed to sync $DATE_DIR"
+        log "ERROR: Failed to sync $DATE_DIR/$CAMERA"
     fi
 done
 
