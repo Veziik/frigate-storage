@@ -1,0 +1,11 @@
+# Logs (keep locally but don't push)
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
