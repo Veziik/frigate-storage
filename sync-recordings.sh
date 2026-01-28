@@ -12,7 +12,7 @@ set -euo pipefail
 
 # Configuration
 FRIGATE_RECORDINGS="/home/daniel/frigate-setup/storage/recordings"
-RCLONE_REMOTE="gdrive:frigate-recordings"  # Adjust remote name if different
+RCLONE_REMOTE="Drive:Frigate Recordings"  # Google Drive folder for recordings
 RETENTION_DAYS=90
 LOG_FILE="/home/daniel/frigate-storage/sync.log"
 LOCK_FILE="/home/daniel/frigate-storage/.sync.lock"
@@ -51,8 +51,8 @@ if ! command -v rclone &> /dev/null; then
 fi
 
 # Check remote is configured
-if ! rclone listremotes | grep -q "^gdrive:"; then
-    log "ERROR: rclone remote 'gdrive' not configured. Run: rclone config"
+if ! rclone listremotes | grep -q "^Drive:"; then
+    log "ERROR: rclone remote 'Drive' not configured. Run: rclone config"
     exit 1
 fi
 

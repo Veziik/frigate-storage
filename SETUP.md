@@ -55,7 +55,7 @@ Follow prompts:
 
 Verify:
 ```bash
-rclone lsd gdrive:
+rclone lsd Drive:
 ```
 
 ### Step 3: Clone Repository
@@ -112,7 +112,7 @@ Edit `sync-recordings.sh`:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FRIGATE_RECORDINGS` | `/home/daniel/frigate-setup/storage/recordings` | Source |
-| `RCLONE_REMOTE` | `gdrive:frigate-recordings` | Destination |
+| `RCLONE_REMOTE` | `Drive:Frigate Recordings` | Destination |
 | `RETENTION_DAYS` | `90` | Cloud retention |
 
 ---
