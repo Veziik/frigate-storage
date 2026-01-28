@@ -8,12 +8,12 @@ Complete instructions for setting up the Frigate recording backup system.
 
 ## Overview
 
-**Purpose**: Backup Frigate NVR recordings to Google Drive with 90-day retention.
+**Purpose**: Backup Frigate NVR `back_door` camera recordings to Google Drive with 90-day retention.
 
 **Architecture**:
 - **Frigate**: Keeps 2 days locally at `/home/daniel/frigate-setup/storage/recordings/`
-- **rclone**: Syncs recordings to Google Drive nightly
-- **Google Drive**: Stores full 90-day archive (~2.5TB)
+- **rclone**: Syncs `back_door` camera only to Google Drive nightly
+- **Google Drive**: Stores 90-day archive (~1.5TB for back_door only)
 
 ---
 
@@ -112,7 +112,8 @@ Edit `sync-recordings.sh`:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FRIGATE_RECORDINGS` | `/home/daniel/frigate-setup/storage/recordings` | Source |
-| `RCLONE_REMOTE` | `Drive:Frigate Recordings` | Destination |
+| `RCLONE_REMOTE` | `Drive:Frigate Recordings/back_door` | Destination |
+| `CAMERA` | `back_door` | Camera to sync |
 | `RETENTION_DAYS` | `90` | Cloud retention |
 
 ---
