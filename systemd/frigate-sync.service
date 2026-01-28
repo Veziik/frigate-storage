@@ -1,0 +1,18 @@
+[Unit]
+Description=Frigate Recording Sync to GitHub LFS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=daniel
+WorkingDirectory=/home/daniel/frigate-storage
+ExecStart=/home/daniel/frigate-storage/sync-recordings.sh
+StandardOutput=append:/home/daniel/frigate-storage/sync.log
+StandardError=append:/home/daniel/frigate-storage/sync.log
+
+# Timeout after 2 hours (large uploads may take time)
+TimeoutStartSec=7200
+
+[Install]
+WantedBy=multi-user.target

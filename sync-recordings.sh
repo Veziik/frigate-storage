@@ -1,108 +1,160 @@
 #!/bin/bash
-# Frigate Recordings Sync Script
-# Syncs recordings to git repo with 90-day retention
-# Designed to run nightly via cron BEFORE Frigate deletes old recordings
+# Frigate Recordings Sync Script - GitHub LFS Mode
+# Stages recordings temporarily, pushes to GitHub LFS, then cleans local copy
+# Requires: git-lfs, ~35GB temporary disk space
+#
+# Storage model:
+# - Local: Only temporary staging (~1 day at a time)
+# - GitHub LFS: Full 90-day archive
+# - Frigate: 2-day rolling window
 
 set -euo pipefail
 
 # Configuration
 FRIGATE_RECORDINGS="/home/daniel/frigate-setup/storage/recordings"
 STORAGE_REPO="/home/daniel/frigate-storage"
+STAGING_DIR="$STORAGE_REPO/recordings"
 RETENTION_DAYS=90
-LOG_FILE="/home/daniel/frigate-storage/sync.log"
+LOG_FILE="$STORAGE_REPO/sync.log"
+LOCK_FILE="$STORAGE_REPO/.sync.lock"
 
 # Logging function
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "========== Starting Frigate Recording Sync =========="
+# Cleanup function
+cleanup() {
+    rm -f "$LOCK_FILE"
+}
+trap cleanup EXIT
 
-# Ensure repo directory exists
+# Prevent concurrent runs
+if [ -f "$LOCK_FILE" ]; then
+    log "ERROR: Another sync is running (lock file exists). Exiting."
+    exit 1
+fi
+echo $$ > "$LOCK_FILE"
+
+log "========== Starting Frigate Recording Sync (LFS Mode) =========="
+
 cd "$STORAGE_REPO"
 
-# Get yesterday's date (the day most likely to be deleted soon by Frigate's 2-day retention)
-# Also sync today's recordings to be safe
+# Check available disk space (need at least 40GB for staging)
+AVAILABLE_GB=$(df -BG "$STORAGE_REPO" | awk 'NR==2 {print $4}' | tr -d 'G')
+if [ "$AVAILABLE_GB" -lt 40 ]; then
+    log "WARNING: Only ${AVAILABLE_GB}GB available. Need 40GB for safe staging."
+fi
+
+# Get dates to sync (yesterday and today - before Frigate's 2-day cleanup)
 YESTERDAY=$(date -d "yesterday" '+%Y-%m-%d')
 TODAY=$(date '+%Y-%m-%d')
 
-log "Syncing recordings for: $YESTERDAY and $TODAY"
+log "Processing dates: $YESTERDAY, $TODAY"
+log "Available disk space: ${AVAILABLE_GB}GB"
 
-# Create recordings directory in repo if it doesn't exist
-mkdir -p "$STORAGE_REPO/recordings"
+# Ensure staging directory exists
+mkdir -p "$STAGING_DIR"
 
-# Sync recordings using rsync (efficient incremental transfer)
-# Only sync directories that exist
+# Process each date one at a time to minimize disk usage
 for DATE_DIR in "$YESTERDAY" "$TODAY"; do
     SOURCE_DIR="$FRIGATE_RECORDINGS/$DATE_DIR"
-    if [ -d "$SOURCE_DIR" ]; then
-        log "Syncing $DATE_DIR..."
-        rsync -av --progress "$SOURCE_DIR" "$STORAGE_REPO/recordings/" 2>&1 | tail -5 | tee -a "$LOG_FILE"
+    DEST_DIR="$STAGING_DIR/$DATE_DIR"
+
+    if [ ! -d "$SOURCE_DIR" ]; then
+        log "No recordings found for $DATE_DIR, skipping"
+        continue
+    fi
+
+    # Check if already synced (directory exists in git)
+    if git ls-tree -d HEAD --name-only 2>/dev/null | grep -q "recordings/$DATE_DIR"; then
+        log "$DATE_DIR already in repo, checking for new files..."
+    fi
+
+    log "Staging $DATE_DIR..."
+
+    # Copy recordings to staging (rsync for efficiency)
+    rsync -av --info=progress2 "$SOURCE_DIR/" "$DEST_DIR/" 2>&1 | tail -5 | tee -a "$LOG_FILE"
+
+    if [ $? -ne 0 ]; then
+        log "ERROR: rsync failed for $DATE_DIR"
+        continue
+    fi
+
+    # Count files staged
+    FILE_COUNT=$(find "$DEST_DIR" -type f -name "*.mp4" 2>/dev/null | wc -l)
+    DIR_SIZE=$(du -sh "$DEST_DIR" 2>/dev/null | cut -f1)
+    log "Staged $FILE_COUNT files ($DIR_SIZE) for $DATE_DIR"
+
+    # Add to git (LFS will handle large files)
+    log "Adding to git..."
+    git add "$DEST_DIR"
+
+    # Commit this date
+    if ! git diff --cached --quiet; then
+        git commit -m "Add recordings: $DATE_DIR
+
+Files: $FILE_COUNT
+Size: $DIR_SIZE
+Cameras: $(ls "$DEST_DIR"/*/ 2>/dev/null | head -5 | xargs -I{} basename {} | tr '\n' ', ' || echo 'various')"
+
+        log "Pushing $DATE_DIR to GitHub LFS..."
+        if git push origin main 2>&1 | tee -a "$LOG_FILE"; then
+            log "Successfully pushed $DATE_DIR"
+
+            # Clean up local staging after successful push
+            log "Cleaning local staging for $DATE_DIR..."
+            rm -rf "$DEST_DIR"
+            git rm -rf --cached "$DEST_DIR" 2>/dev/null || true
+        else
+            log "ERROR: Push failed for $DATE_DIR. Keeping local copy for retry."
+        fi
     else
-        log "No recordings found for $DATE_DIR"
+        log "No new files to commit for $DATE_DIR"
     fi
 done
 
-# Generate manifest of all recordings
-log "Generating recordings manifest..."
-find "$STORAGE_REPO/recordings" -type f -name "*.mp4" | sort > "$STORAGE_REPO/manifest.txt"
-TOTAL_FILES=$(wc -l < "$STORAGE_REPO/manifest.txt")
-TOTAL_SIZE=$(du -sh "$STORAGE_REPO/recordings" 2>/dev/null | cut -f1)
-log "Total recordings: $TOTAL_FILES files, $TOTAL_SIZE"
+# Update manifest (list of all recordings in repo)
+log "Updating remote manifest..."
+git ls-tree -r HEAD --name-only | grep "\.mp4$" | sort > "$STORAGE_REPO/manifest.txt" 2>/dev/null || true
+TOTAL_FILES=$(wc -l < "$STORAGE_REPO/manifest.txt" 2>/dev/null || echo "0")
+log "Total recordings in repo: $TOTAL_FILES files"
 
-# Commit changes to git (track manifest, not the videos themselves for repo size)
-log "Committing manifest to git..."
-git add manifest.txt
-git add -A recordings/ 2>/dev/null || true
-
-# Check if there are changes to commit
-if git diff --cached --quiet; then
-    log "No new changes to commit"
-else
-    git commit -m "Sync recordings: $TODAY
-
-Files: $TOTAL_FILES
-Size: $TOTAL_SIZE
-Synced: $YESTERDAY, $TODAY"
-
-    log "Pushing to remote..."
-    git push origin main 2>&1 | tee -a "$LOG_FILE" || {
-        log "ERROR: Push failed. Will retry on next run."
-    }
+# Commit manifest update
+git add manifest.txt 2>/dev/null || true
+if ! git diff --cached --quiet; then
+    git commit -m "Update manifest: $TOTAL_FILES files"
+    git push origin main 2>&1 | tee -a "$LOG_FILE" || true
 fi
 
-# Cleanup: Remove recordings older than retention period
-log "Checking for recordings older than $RETENTION_DAYS days..."
+# Remote cleanup: Remove recordings older than retention period
+log "Checking for recordings older than $RETENTION_DAYS days to remove from repo..."
 CUTOFF_DATE=$(date -d "$RETENTION_DAYS days ago" '+%Y-%m-%d')
 log "Cutoff date: $CUTOFF_DATE"
 
-REMOVED_COUNT=0
-for DATE_DIR in "$STORAGE_REPO/recordings"/*; do
-    if [ -d "$DATE_DIR" ]; then
-        DIR_NAME=$(basename "$DATE_DIR")
-        # Check if directory name is a date and older than cutoff
-        if [[ "$DIR_NAME" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-            if [[ "$DIR_NAME" < "$CUTOFF_DATE" ]]; then
-                log "Removing old recordings: $DIR_NAME"
-                rm -rf "$DATE_DIR"
-                ((REMOVED_COUNT++))
-            fi
-        fi
+# Find old directories in the repo
+OLD_DIRS=$(git ls-tree -d HEAD --name-only recordings/ 2>/dev/null | while read dir; do
+    DIR_NAME=$(basename "$dir")
+    if [[ "$DIR_NAME" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [[ "$DIR_NAME" < "$CUTOFF_DATE" ]]; then
+        echo "$dir"
     fi
-done
+done)
 
-if [ $REMOVED_COUNT -gt 0 ]; then
-    log "Removed $REMOVED_COUNT old recording directories"
+if [ -n "$OLD_DIRS" ]; then
+    log "Removing old recordings from repo..."
+    for OLD_DIR in $OLD_DIRS; do
+        log "Removing: $OLD_DIR"
+        git rm -rf "$OLD_DIR" 2>/dev/null || true
+    done
 
-    # Update manifest after cleanup
-    find "$STORAGE_REPO/recordings" -type f -name "*.mp4" | sort > "$STORAGE_REPO/manifest.txt"
-
-    # Commit the removal
-    git add -A
-    git commit -m "Cleanup: Removed recordings older than $CUTOFF_DATE ($REMOVED_COUNT directories)"
-    git push origin main 2>&1 | tee -a "$LOG_FILE" || {
-        log "ERROR: Push after cleanup failed"
-    }
+    if ! git diff --cached --quiet; then
+        git commit -m "Cleanup: Remove recordings before $CUTOFF_DATE"
+        git push origin main 2>&1 | tee -a "$LOG_FILE" || log "ERROR: Cleanup push failed"
+    fi
 fi
+
+# Final disk space check
+FINAL_SPACE=$(df -h "$STORAGE_REPO" | awk 'NR==2 {print $4}')
+log "Disk space after sync: $FINAL_SPACE available"
 
 log "========== Sync Complete =========="

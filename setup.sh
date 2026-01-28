@@ -1,92 +1,100 @@
 #!/bin/bash
 # Frigate Storage Setup Script
-# Run once to configure the sync system
+# Installs systemd timer for persistent nightly sync
+# Run with sudo for systemd installation
 
 set -euo pipefail
 
 STORAGE_REPO="/home/daniel/frigate-storage"
+SYSTEMD_DIR="/etc/systemd/system"
 
 echo "========== Frigate Storage Setup =========="
 
-# Check for git-lfs (optional but recommended)
-if ! command -v git-lfs &> /dev/null; then
-    echo "WARNING: git-lfs is not installed."
-    echo "For large video files, install with: sudo apt-get install git-lfs"
-    echo "Continuing without LFS (videos will be stored directly in git)..."
+# Check if running as root for systemd installation
+if [ "$EUID" -ne 0 ]; then
+    echo "Note: Run with sudo to install systemd services"
+    echo "      sudo ./setup.sh"
+    echo ""
+    echo "Continuing with non-root setup..."
+    SKIP_SYSTEMD=true
 else
-    echo "git-lfs is installed"
-    cd "$STORAGE_REPO"
-    git lfs install
-    git lfs track "*.mp4"
-    git add .gitattributes 2>/dev/null || true
+    SKIP_SYSTEMD=false
 fi
+
+# Verify git-lfs is installed
+if ! command -v git-lfs &> /dev/null; then
+    echo "ERROR: git-lfs is not installed."
+    echo "Install with: sudo apt-get install git-lfs"
+    exit 1
+fi
+echo "✓ git-lfs is installed"
+
+# Initialize git-lfs in repo
+cd "$STORAGE_REPO"
+git lfs install
+git lfs track "*.mp4"
+git add .gitattributes 2>/dev/null || true
+echo "✓ git-lfs configured to track *.mp4 files"
 
 # Make scripts executable
 chmod +x "$STORAGE_REPO/sync-recordings.sh"
-chmod +x "$STORAGE_REPO/cleanup-git-history.sh"
+chmod +x "$STORAGE_REPO/cleanup-git-history.sh" 2>/dev/null || true
+echo "✓ Scripts made executable"
 
-# Create recordings directory
-mkdir -p "$STORAGE_REPO/recordings"
-
-# Initialize git config for the repo
-cd "$STORAGE_REPO"
+# Configure git for the repo
 git config user.email "frigate-sync@localhost"
 git config user.name "Frigate Sync"
+echo "✓ Git configured"
 
-# Initial commit if needed
-if [ ! -f "$STORAGE_REPO/.gitignore" ]; then
-    cat > "$STORAGE_REPO/.gitignore" << 'EOF'
-# Logs
-*.log
+# Create recordings staging directory
+mkdir -p "$STORAGE_REPO/recordings"
+echo "✓ Staging directory created"
 
-# Temporary files
-*.tmp
-*.swp
-EOF
-    git add .gitignore
+# Install systemd services if running as root
+if [ "$SKIP_SYSTEMD" = false ]; then
+    echo ""
+    echo "Installing systemd services..."
+
+    # Copy service files
+    cp "$STORAGE_REPO/systemd/frigate-sync.service" "$SYSTEMD_DIR/"
+    cp "$STORAGE_REPO/systemd/frigate-sync.timer" "$SYSTEMD_DIR/"
+
+    # Reload systemd
+    systemctl daemon-reload
+
+    # Enable and start timer
+    systemctl enable frigate-sync.timer
+    systemctl start frigate-sync.timer
+
+    echo "✓ Systemd timer installed and enabled"
+    echo ""
+    echo "Timer status:"
+    systemctl status frigate-sync.timer --no-pager || true
+else
+    echo ""
+    echo "========== Manual Systemd Installation =========="
+    echo "Run these commands to install the timer:"
+    echo ""
+    echo "  sudo cp $STORAGE_REPO/systemd/frigate-sync.service /etc/systemd/system/"
+    echo "  sudo cp $STORAGE_REPO/systemd/frigate-sync.timer /etc/systemd/system/"
+    echo "  sudo systemctl daemon-reload"
+    echo "  sudo systemctl enable frigate-sync.timer"
+    echo "  sudo systemctl start frigate-sync.timer"
 fi
 
-# Commit setup files
+# Commit any setup changes
 git add -A
-git commit -m "Initial setup: sync scripts and configuration" 2>/dev/null || echo "No new files to commit"
-
-echo ""
-echo "========== Setting up Cron Jobs =========="
-echo ""
-echo "Add these lines to your crontab (crontab -e):"
-echo ""
-echo "# Sync Frigate recordings nightly at 3 AM"
-echo "0 3 * * * $STORAGE_REPO/sync-recordings.sh >> $STORAGE_REPO/cron.log 2>&1"
-echo ""
-echo "# Clean up git history monthly on the 1st at 4 AM"
-echo "0 4 1 * * $STORAGE_REPO/cleanup-git-history.sh >> $STORAGE_REPO/cron.log 2>&1"
-echo ""
-
-# Offer to install cron jobs automatically
-read -p "Install cron jobs automatically? (y/n) " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    # Check if cron jobs already exist
-    if crontab -l 2>/dev/null | grep -q "sync-recordings.sh"; then
-        echo "Cron job for sync already exists, skipping..."
-    else
-        (crontab -l 2>/dev/null; echo "# Sync Frigate recordings nightly at 3 AM") | crontab -
-        (crontab -l 2>/dev/null; echo "0 3 * * * $STORAGE_REPO/sync-recordings.sh >> $STORAGE_REPO/cron.log 2>&1") | crontab -
-    fi
-
-    if crontab -l 2>/dev/null | grep -q "cleanup-git-history.sh"; then
-        echo "Cron job for cleanup already exists, skipping..."
-    else
-        (crontab -l 2>/dev/null; echo "# Clean up git history monthly") | crontab -
-        (crontab -l 2>/dev/null; echo "0 4 1 * * $STORAGE_REPO/cleanup-git-history.sh >> $STORAGE_REPO/cron.log 2>&1") | crontab -
-    fi
-
-    echo "Cron jobs installed. Current crontab:"
-    crontab -l
+if ! git diff --cached --quiet; then
+    git commit -m "Setup: Configure git-lfs and systemd services"
+    git push origin main 2>/dev/null || echo "Push pending - run manually if needed"
 fi
 
 echo ""
 echo "========== Setup Complete =========="
 echo ""
-echo "To run the sync manually: $STORAGE_REPO/sync-recordings.sh"
-echo "To view logs: tail -f $STORAGE_REPO/sync.log"
+echo "Commands:"
+echo "  Manual sync:     $STORAGE_REPO/sync-recordings.sh"
+echo "  View logs:       tail -f $STORAGE_REPO/sync.log"
+echo "  Timer status:    systemctl status frigate-sync.timer"
+echo "  Run now:         sudo systemctl start frigate-sync.service"
+echo ""
